@@ -11,8 +11,8 @@ import botocore
 import parser
 
 # Defaults, can be modified
-AWS_ACCESS_KEY = 'AKIAJ3DNNCL6WSDOO4DQ'
-AWS_SECRET_KEY = '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'
+AWS_ACCESS_KEY = 'xx'
+AWS_SECRET_KEY = 'xxx'
 AWS_REGIONS = u'us-east-1|us-west-2'
 AWS_PROFILE = u'DEV_AWS_CoreEngineering|AWS_CoreEngineering'
 profile_dict = {'DEV_AWS_CoreEngineering': 'CLOUD-ENGINEERING', 'PROD_AWS_CoreEngineering': 'Innovation-PROD'}
