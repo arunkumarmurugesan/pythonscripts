@@ -1,0 +1,417 @@
+# !/usr/bin/python
+# title           : RDS Cluster Snapshot and DB Dump backup to S3
+# author          : Arunkumar M
+# date            : 20181211
+# usage           : python aws_db_backup_restoration.py -e dev -s yes -b yes -db exampledb
+# ==============================================================================
+import boto3
+import paramiko
+from scp import SCPClient
+import logging, argparse, os, sys, time, pipes
+
+# Contstant Variables
+DATETIME = time.strftime('%Y-%m-%d-%H-%M-%S')
+YEAR = time.strftime('%Y')
+MONTH = time.strftime('%m')
+BACKUP_PATH = '/mnt/backupdb/dbpg'
+TODAYBACKUPPATH = BACKUP_PATH + '/' + DATETIME
+BACKUP_DIR = BACKUP_PATH + '/' + YEAR + '/' + MONTH
+REGION = "us-east-2"
+SERVICE = "rds"
+FAILED_EXIT_CODE = 1
+
+# Enable the logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt='%Y-%m-%d %H:%M:%S %Z')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
+
+# Connect to AWS boto3 Client
+def aws_connect_client(SERVICE, REGION):
+    try:
+        # Gaining API session
+        # session = boto3.Session(aws_access_key_id="", aws_secret_access_key="")
+        session = boto3.Session()
+        # Connect the client
+        conn_client = session.client(SERVICE, REGION)
+    except Exception as e:
+        logger.error('Could not connect to region: {} and resources: {} , Exception: {}\n'.format(REGION, SERVICE, e))
+        conn_client = None
+    return conn_client
+
+
+# Describe the RDS Cluster details, get the Cluster name, master username and endpoint for the cluster.
+def getDBClusterIdentifier(CLUSTERNAME):
+    rds_conn = aws_connect_client('rds', REGION)
+    try:
+        rds_response = rds_conn.describe_db_clusters(DBClusterIdentifier=CLUSTERNAME)
+    except Exception as e:
+        logger.error('Cloud not able to describe the rds instance, Exception: {}'.format(e))
+    rds_endpoint = rds_response["DBClusters"][0]["Endpoint"]
+    rds_username = rds_response["DBClusters"][0]["MasterUsername"]
+    rds_port = rds_response["DBClusters"][0]["Port"]
+    rds_identifier = rds_response["DBClusters"][0]["DBClusterIdentifier"]
+    return rds_endpoint, rds_username, rds_port, rds_identifier
+
+
+# Check if the snapshot exist with the same name or not, if exists delete the existing snapshot and create a new snapshot.
+def checkSnapshotExists(CLUSTERNAME):
+    rds_conn = aws_connect_client('rds', REGION)
+    snapshot_identifier = CLUSTERNAME + "-upgrade"
+    _, _, _, DB_IDENTIFIER = getDBClusterIdentifier(CLUSTERNAME)
+    try:
+        snap_exist = rds_conn.describe_db_cluster_snapshots(
+            DBClusterIdentifier=DB_IDENTIFIER,
+            DBClusterSnapshotIdentifier=snapshot_identifier,
+            SnapshotType='manual',
+        )
+        if snap_exist['DBClusterSnapshots'][0]['DBClusterSnapshotIdentifier'] == snapshot_identifier:
+            delete = rds_conn.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier=snapshot_identifier)
+            if delete['ResponseMetadata']['HTTPStatusCode'] == 200:
+                logger.info('The snapshot already exist : {} so deleting the snapshot'.format(snapshot_identifier))
+    except Exception as e:
+        logger.error('The snapshot does not exist : : {}'.format(e))
+
+
+# Create new snapshot for the cluster, with the following tag values with name ending with -upgrade.
+def createSnapshots(CLUSTERNAME):
+    _, _, _, DB_IDENTIFIER = getDBClusterIdentifier(CLUSTERNAME)
+    rds_conn = aws_connect_client('rds', REGION)
+    snapshot_identifier = CLUSTERNAME + "-upgrade"
+    checkSnapshotExists(CLUSTERNAME)
+    try:
+        snap = rds_conn.create_db_cluster_snapshot(
+            DBClusterSnapshotIdentifier=snapshot_identifier,
+            DBClusterIdentifier=DB_IDENTIFIER,
+            Tags=[
+                {
+                    'Key': 'Upgrade',
+                    'Value': 'Yes'
+                },
+                {
+                    'Key': 'DeleteOn',
+                    'Value': 'Yes'
+                }
+            ]
+        )
+
+        if snap['ResponseMetadata']['HTTPStatusCode'] == 200:
+            status = "available"
+            while True:
+                snap_exist = rds_conn.describe_db_cluster_snapshots(
+                    DBClusterIdentifier=DB_IDENTIFIER,
+                    DBClusterSnapshotIdentifier=snapshot_identifier,
+                    SnapshotType='manual')
+                if snap_exist['DBClusterSnapshots'][0]['Status'] == status:
+                    logger.info('The snapshot has been created : {}'.format(snapshot_identifier))
+                    break
+                else:
+                    time.sleep(10)
+                    logger.info('The snapshot is creating: {}'.format(snapshot_identifier))
+    except Exception as e:
+        logger.error('Cloud not able to create a snapshot, Exception : {}'.format(e))
+        sys.exit(FAILED_EXIT_CODE)
+
+
+# Initiate the database dump backup process
+def createDBDump(DBNAME, BUCKET_NAME, PASSWORD):
+    DB = DBNAME
+    logger.info("Creatting the database dump backup to local directory")
+    RDS_ENDPOINT, RDS_USERNAME, RDS_PORT, _ = getDBClusterIdentifier(DB_CLUSTER_NAME)
+    print(RDS_ENDPOINT, RDS_USERNAME, RDS_PORT, PASSWORD)
+    # Getting current DateTime to create the separate backup folder like "20180817-123433".
+    # Checking if backup folder already exists or not. If not exists will create it.
+    try:
+        logger.info("Checking the backup directory is exist or not")
+        os.stat(BACKUP_DIR)
+    except Exception as e:
+        logger.info("The backup directory is not exist hence creating")
+        os.makedirs(BACKUP_DIR)
+
+    try:
+        logger.info("Initiaizing the database dump back process for database {}".format(DB))
+        dumpcmd = "PGPASSWORD=" + PASSWORD + " pg_dump" + " -h " + RDS_ENDPOINT + " -p " + str(
+            RDS_PORT) + " -U " + RDS_USERNAME + " -d " + DB + " > " + pipes.quote(
+            BACKUP_DIR) + "/" + DB + "-" + DATETIME + ".sql"
+        os.system(dumpcmd)
+        gzipcmd = "gzip " + pipes.quote(BACKUP_DIR) + "/" + DB + "-" + DATETIME + ".sql"
+        os.system(gzipcmd)
+    except Exception as e:
+        logger.error(
+            "Unable to connect to the database {} No database found with the name {}. Exception: {}".format(DB, DB, e))
+        sys.exit(FAILED_EXIT_CODE)
+    logger.info("Your backups have been stored in '" + BACKUP_DIR + "' directory")
+    upload_files(BACKUP_PATH, BUCKET_NAME)
+
+
+# Upload files to S3 Bucket
+def upload_files(path, BUCKET_NAME):
+    logger.info("Upload dbdump file to S3 bucket : {} ".format(BUCKET_NAME))
+    try:
+        s3 = boto3.resource('s3')
+        bucket = s3.Bucket(BUCKET_NAME)
+    except Exception as e:
+        logger.error("Unable to connect the s3 session".format(e))
+        sys.exit(FAILED_EXIT_CODE)
+    for subdir, dirs, files in os.walk(path):
+        for file in files:
+            full_path = os.path.join(subdir, file)
+            with open(full_path, 'rb') as data:
+                try:
+                    bucket.put_object(Key=full_path[len(path) + 1:], Body=data)
+                    logger.info("Successfully uploaded database dump: {} to s3: {}".format(full_path, BUCKET_NAME))
+                except Exception as e:
+                    logger.error("Unable to updload the database dump. Exception: {}".format(e))
+                    sys.exit(FAILED_EXIT_CODE)
+                # shutil.rmtree(TODAYBACKUPPATH)
+
+
+def securecopyDBDump(DBNAME, SSH_USER, HOST, PORT):
+    logger.info("Started scp database dump backup to ........")
+    sshcon = paramiko.SSHClient()
+    try:
+        logger.info("Login to remote host")
+        sshcon.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # no known_hosts error
+        print(sshcon.connect(hostname=HOST, port=PORT, username=SSH_USER))  # no passwd needed
+    except Exception as e:
+        logger.error("Unable to login to connect to the remote  host: {} Exception: {}".format(HOST, e))
+        sys.exit(FAILED_EXIT_CODE)
+
+    SOURCEFILE = BACKUP_DIR + "/" + DBNAME + "-" + DATETIME + ".sql.gz"
+    REMOTE_DIR = "~"
+    try:
+        logger.info("Check if the backup directory exist or not")
+        os.stat(BACKUP_DIR)
+    except:
+        logger.info("The backup directory does not exist, hence exiting")
+        sys.exit(FAILED_EXIT_CODE)
+
+    scp = SCPClient(sshcon.get_transport())
+    scp.put(SOURCEFILE, REMOTE_DIR)
+    logger.info(
+        "Successfully copied database dump file {} from source directory {} to destination {} directory ".format(DBNAME,
+                                                                                                                 SOURCEFILE,
+                                                                                                                 REMOTE_DIR))
+    scp.close()
+
+
+def restoreDatabaseDump(DBNAME, SSH_USER, HOST, PORT, PASSWORD, RDS_ENDPONIT):
+    print(DBNAME, SSH_USER, HOST, PORT, PASSWORD)
+    RDS_ENDPOINT, RDS_USERNAME, RDS_PORT, _ = getDBClusterIdentifier(DB_CLUSTER_NAME)
+    print(RDS_ENDPOINT, RDS_USERNAME, RDS_PORT, DB_CLUSTER_NAME)
+    DB = DBNAME
+    c = paramiko.SSHClient()
+    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c.connect(hostname=HOST, username=SSH_USER)
+    logger.info("Check for the databse {} exist or not".format(DB))
+    # cmd = "sudo supervisorctl status | grep -i 'NRT' | awk '{print $1}'"
+    check_db = ("PGPASSWORD=" + PASSWORD + " psql" + " -h " + RDS_ENDPOINT + " -p " + str(
+        RDS_PORT) + " -U " + RDS_USERNAME + " -d " + "rootdatabase" + " -c " + "\"SELECT datname FROM pg_catalog.pg_database WHERE datname = '{}';\"" + " | grep {} | tr -d ' '").format(
+        DB, DB)
+    stdin, stdout, stderr = c.exec_command(check_db)
+    output = stdout.read()
+    check = output.strip()
+    if check == DB:
+        logger.info("The database: {} already exist in rds cluster {} ".format(DB, DB_CLUSTER_NAME))
+        try:
+            logger.info(
+                "Database: {} present, hence killing the session and dropping the database {} in rds cluster {}".format(
+                    DB, DB, DB_CLUSTER_NAME))
+            kill_session = ("PGPASSWORD=" + PASSWORD + " psql" + " -h " + RDS_ENDPOINT + " -p " + str(
+                RDS_PORT) + " -U " + RDS_USERNAME + " -d " + "rootdatabase" + " -c " + "\"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}';\"").format(
+                DB)
+            stdin, stdout, stderr = c.exec_command(kill_session)
+            session = stdout.read()
+            print("Printing the output of", session)
+        except Exception as e:
+            logger.info(
+                "Unable to kill the session on dbname {} in rds cluster {}, Exception: {}".format(DB, DB_CLUSTER_NAME,
+                                                                                                  e))
+            sys.exit(FAILED_EXIT_CODE)
+        try:
+            drop_db = ("PGPASSWORD=" + PASSWORD + " psql" + " -h " + RDS_ENDPOINT + " -p " + str(
+                RDS_PORT) + " -U " + RDS_USERNAME + " -d " + "rootdatabase" + " -c " + "\"DROP DATABASE {}\";").format(DB)
+            stdin, stdout, stderr = c.exec_command(drop_db)
+            db_drop = stdout.read()
+            print("Printing the output of drop command", db_drop)
+        except Exception as e:
+            logger.info("Unable to drop the database {}".format(DB))
+            sys.exit(FAILED_EXIT_CODE)
+        try:
+            # create_db = "PGPASSWORD=" + PASSWORD + " psql" + " -h " + RDS_ENDPOINT + " -p " + str(RDS_PORT) + " -U " + RDS_USERNAME + " -d " + "rootdatabase" + " -c 'create database rootdatabase_beats ';"
+            create_db = ("PGPASSWORD=" + PASSWORD + " psql" + " -h " + RDS_ENDPOINT + " -p " + str(
+                RDS_PORT) + " -U " + RDS_USERNAME + " -d " + "rootdatabase" + " -c " + "\"CREATE DATABASE {}\";").format(DB)
+            stdin, stdout, stderr = c.exec_command(create_db)
+            db_create = stdout.read()
+            print(db_create)
+        except Exception as e:
+            logger.info("Unable to create the database {} in RDS cluster {} ".format(DB, DB_CLUSTER_NAME))
+            sys.exit(FAILED_EXIT_CODE)
+    else:
+        logger.info("The dabtabase {} does not exist, hence creating the database {} in rds cluster {}".format(DB, DB,
+                                                                                                               DB_CLUSTER_NAME))
+        try:
+            # create_db = "PGPASSWORD=" + PASSWORD + " psql" + " -h " + RDS_ENDPOINT + " -p " + str(RDS_PORT) + " -U " + RDS_USERNAME + " -d " + "rootdatabase" + " -c 'create database rootdatabase_beats ';"
+            create_db = ("PGPASSWORD=" + PASSWORD + " psql" + " -h " + RDS_ENDPOINT + " -p " + str(
+                RDS_PORT) + " -U " + RDS_USERNAME + " -d " + "rootdatabase" + " -c " + "\"CREATE DATABASE {}\";").format(DB)
+            stdin, stdout, stderr = c.exec_command(create_db)
+            db_create = stdout.read()
+            print(db_create)
+        except Exception as e:
+            logger.info("Unable to create the database {}".format(DB))
+            sys.exit(FAILED_EXIT_CODE)
+
+    logger.info("-----------------")
+    list_file = ("ls -ltrh | tail -1 | awk '{print $9}' ")
+    stdin, stdout, stderr = c.exec_command(list_file)
+    cmd = stdout.read()
+    logger.info("Finding the latest databse dump zip file: {} ".format(cmd))
+    extract = ("gunzip {}").format(cmd)
+    stdin, stdout, stderr = c.exec_command(extract)
+    ext = stdout.read()
+    logger.info("Unzipping the database dump file {} ".format(cmd))
+    logger.info("Restoring the Database dump to {}".format(DB_CLUSTER_NAME))
+    list_sql = ("ls -ltrh | tail -1 | awk '{print $9}' ")
+    stdin, stdout, stderr = c.exec_command(list_sql)
+    sqlfile = stdout.read()
+    rest_db = ("PGPASSWORD=" + PASSWORD + " psql" + " -h " + RDS_ENDPOINT + " -p " + str(
+        RDS_PORT) + " -U " + RDS_USERNAME + " -d " + DB + " -f " + sqlfile + ";")
+    print(rest_db)
+    stdin, stdout, stderr = c.exec_command(rest_db)
+    result = stdout.read()
+    print(result)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='rootdatabase RDS Snapshot and DBdump backup script')
+    parser.add_argument('-e', '--env', help='Enter the envieronment name eg. -e dev', required=True)
+    parser.add_argument('-s', '--snapshot', help='To create new snapshot eg. -s yes', required=False)
+    parser.add_argument('-db', '--dbname',
+                        help='Pass the database name for which you want to take the dump eg. -db <database-name>',
+                        required=False)
+    parser.add_argument('-b', '--dbbackup', help='Initiate the db dump backup process  eg. -b yes', required=False)
+    parser.add_argument('-r', '--restore', help='Restore the db dump backup process  eg. -r yes', required=False)
+    args = vars(parser.parse_args())
+
+
+    # Variables for prod RDS Cluster
+    def prod():
+        DB_CLUSTER_NAME = "prod-pg-cluster"
+        BUCKET_NAME = "prod-db-backup"
+        PASSWORD = "dummpypwd"
+        SSH_USER = "ubuntu"
+        HOST = "xxxx"
+        PORT = 22
+        return DB_CLUSTER_NAME, BUCKET_NAME, PASSWORD, SSH_USER, HOST, PORT
+
+
+    # Variables for stage RDS Cluster
+    def stage():
+        DB_CLUSTER_NAME = "stage-pg-cluster"
+        BUCKET_NAME = "staging-db-backup"
+        PASSWORD = "dummpypwd"
+        SSH_USER = "ubuntu"
+        HOST = "xxxx"
+        RDS_ENDPOINT = "xxxxxx.rds.amazonaws.com"
+        PORT = 22
+        return DB_CLUSTER_NAME, BUCKET_NAME, PASSWORD, SSH_USER, HOST, RDS_ENDPOINT, PORT
+
+
+    # Variables for Dev RDS Cluster
+    def dev():
+        DB_CLUSTER_NAME = "dev-pg-cluster"
+        BUCKET_NAME = "dev-pg-cluster"
+        PASSWORD = "dummypwd"
+        SSH_USER = "ubuntu"
+        HOST = "xxx"
+        RDS_ENDPOINT = "xxxxxx.rds.amazonaws.com"
+        PORT = 22
+        return DB_CLUSTER_NAME, BUCKET_NAME, PASSWORD, SSH_USER, HOST, RDS_ENDPOINT, PORT
+
+
+    # Calling the respective function using switch case
+    def numbers_to_functions_to_strings(argument):
+        switcher = {
+            prod: prod,
+            stage: stage,
+            dev: dev
+        }
+        # Get the function from switcher dictionary
+        func = switcher.get(argument, "nothing")
+        # Execute the function
+        return func()
+
+
+    # Get the variables from the numbers_to_functions_to_strings(args)
+
+    DB_CLUSTER, BUCKETNAME, PASSWORD, _, _, _ = numbers_to_functions_to_strings(prod)
+
+    if args['snapshot'] == 'yes':
+        if args['env'] == 'dev':
+            DB_CLUSTER_NAME, _, _, _, _, _, _ = numbers_to_functions_to_strings(dev)
+            logger.info("Creating snapshot for Dev RDS Cluster")
+            createSnapshots(DB_CLUSTER_NAME)
+        if args['env'] == 'stage':
+            DB_CLUSTER_NAME, _, _, _, _, _, _ = numbers_to_functions_to_strings(stage)
+            logger.info("Creating snapshot for staging RDS Cluster")
+            createSnapshots(DB_CLUSTER_NAME)
+        if args['env'] == 'prod':
+            DB_CLUSTER_NAME, _, _, _, _, _ = numbers_to_functions_to_strings(prod)
+            logger.info("Creating snapshot for Prod RDS Cluster")
+            createSnapshots(DB_CLUSTER_NAME)
+        if args['env'] == 'dev' and args['dbbackup'] == 'yes':
+            DB_CLUSTER_NAME, BUCKET_NAME, PASSWORD, _, _, _, _ = numbers_to_functions_to_strings(dev)
+            logger.info("Creating db dump from dev rds cluster")
+            createDBDump(args['dbname'], BUCKET_NAME, PASSWORD)
+        if args['env'] == 'stage' and args['dbbackup'] == 'yes':
+            DB_CLUSTER_NAME, BUCKET_NAME, PASSWORD, _, _, _, _ = numbers_to_functions_to_strings(stage)
+            logger.info("Creating db dump from staging rds cluster")
+            createDBDump(args['dbname'], BUCKET_NAME, PASSWORD)
+        if args['env'] == 'prod' and args['dbbackup'] == 'yes':
+            DB_CLUSTER_NAME, BUCKET_NAME, PASSWORD, _, _, _ = numbers_to_functions_to_strings(prod)
+            logger.info("Creating db dump from Prod rds cluster")
+            createDBDump(args['dbname'], BUCKET_NAME, PASSWORD)
+        if args['env'] == 'dev' and args['dbbackup'] == 'yes' and args['restore'] == 'yes':
+            logger.info("Copy db dump backup to ")
+            logger.info("Restore the database dump to dev RDS cluster")
+            _, _, _, SSH_USER, HOST, _, PORT, = numbers_to_functions_to_strings(dev)
+            restoreDatabaseDump()
+        if args['env'] == 'prod' and args['dbbackup'] == 'yes' and args['restore'] == 'yes':
+            logger.info("Copy db dump backup to ")
+            logger.info("Restore the database dump to prod RDS cluster")
+            _, PASSWORD, _, SSH_USER, HOST, RDS_ENDPONIT, PORT = numbers_to_functions_to_strings(stage)
+            # securecopyDBDump(args['dbname'], SSH_USER, HOST, PORT)
+            restoreDatabaseDump(args['dbname'], SSH_USER, HOST, PORT, PASSWORD, RDS_ENDPONIT)
+    else:
+        logger.info("Creating only database dump and backup to S3 bucket eg. -e dev -b yes -db rootdatabasedb")
+        if args['dbbackup'] == 'yes':
+            if args['env'] == 'dev':
+                logger.info("Creating db dump from dev rds cluster")
+                DB_CLUSTER_NAME, BUCKET_NAME, PASSWORD, _, _, _, _ = numbers_to_functions_to_strings(dev)
+                createDBDump(args['dbname'], BUCKET_NAME, PASSWORD)
+            if args['env'] == 'stage':
+                logger.info("Creating db dump from stage rds cluster")
+                DB_CLUSTER_NAME, BUCKET_NAME, PASSWORD, _, _, _, _ = numbers_to_functions_to_strings(stage)
+                createDBDump(args['dbname'], BUCKET_NAME, PASSWORD)
+            if args['env'] == 'prod':
+                logger.info("Creating db dump from Prod rds cluster")
+                DB_CLUSTER_NAME, BUCKET_NAME, PASSWORD, _, _, _ = numbers_to_functions_to_strings(prod)
+                createDBDump(args['dbname'], BUCKET_NAME, PASSWORD)
+            if args['env'] == 'dev' and args['dbbackup'] == 'yes' and args['restore'] == 'yes':
+                logger.info("Copy db dump backup to ")
+                logger.info("Restore the database dump to prod RDS cluster")
+                _, _, _, SSH_USER, HOST, _, PORT, = numbers_to_functions_to_strings(dev)
+                restoreDatabaseDump()
+            if args['env'] == 'prod' and args['dbbackup'] == 'yes' and args['restore'] == 'yes':
+                logger.info("Copy db dump backup to ")
+                logger.info("Restore the database dump to prod RDS cluster")
+                DB_CLUSTER_NAME, _, PASSWORD, SSH_USER, HOST, RDS_ENDPONIT, PORT = numbers_to_functions_to_strings(stage)
+                securecopyDBDump(args['dbname'], SSH_USER, HOST, PORT)
+                restoreDatabaseDump(args['dbname'], SSH_USER, HOST, PORT, PASSWORD, RDS_ENDPONIT)
+
+        else:
+            logger.info("unknown options")
