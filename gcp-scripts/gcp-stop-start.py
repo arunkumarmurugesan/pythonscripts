@@ -17,9 +17,9 @@ logger.addHandler(ch)
 
 class gcpStopStart:
     def __init__(self):
-        self.GCPPROJECTID = "adelphic-cloud"
+        self.GCPPROJECTID = "example-cloud"
         self.ZONE = "us-east4-a"
-        self.SENSUAPI_URI="https://sensu.vianttech.com"
+        self.SENSUAPI_URI="https://sensu.example.com"
 
     def gcpConnect(self):
         try:
