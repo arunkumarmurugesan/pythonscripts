@@ -1,7 +1,10 @@
 import os, sys
 from googleapiclient import discovery
-from oauth2client.client import GoogleCredentials
+from google.oauth2 import service_account
+# from oauth2client.client import GoogleCredentials
 import logging
+import requests
+import time
 
 # Enable the logger
 logger = logging.getLogger(__name__)
@@ -14,18 +17,19 @@ logger.addHandler(ch)
 
 class gcpStopStart:
     def __init__(self):
-        self.GCPPROJECTID = "ecstatic-maxim-596"
+        self.GCPPROJECTID = "adelphic-cloud"
         self.ZONE = "us-east4-a"
+        self.SENSUAPI_URI="https://sensu.vianttech.com"
 
     def gcpConnect(self):
         try:
-            # key_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-            # credentials = service_account.Credentials.from_service_account_file(
-            #     key_path,
-            #     scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            # )
+            key_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            credentials = service_account.Credentials.from_service_account_file(
+                key_path,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
             ## local testing
-            credentials = GoogleCredentials.get_application_default()
+            # credentials = GoogleCredentials.get_application_default()
         except Exception as err:
             logger.error(
                 "Please Set the GOOGLE_APPLICATION_CREDENTIALS as environment variable, Exception : {}".format(err))
@@ -48,6 +52,27 @@ class gcpStopStart:
         except Exception as err:
             logger.error("Unable to stop the instance ID {}. Exception : {}".format(instanceName,err))
 
+    def removeMonitoring(self,instanceName):
+        try:
+            sensu_response = requests.delete("{}/clients/{}".format(self.SENSUAPI_URI,instanceName))
+            logger.info("The instance: {} is removed from sensu monitoring".format(instanceName))
+        except Exception as err:
+            logger.error("Unable to remove the instance {} from sensu, Exception : {}".format(instanceName,err))
+
+    def slienceMonitoring(self,instanceName):
+        postData = {
+            "subscription": "client:{}".format(instanceName),
+            "dc": "ASH1",
+            "expire": 43200,
+            "reason": "Scheduled Stop for 12hr as its stage instance"
+        }
+        header = {"Content-type": "application/json"}
+        try:
+            sensu_response = requests.post("{}/silenced".format(self.SENSUAPI_URI), data=postData, headers=header)
+            logger.info("The instance: {} is removed from sensu monitoring".format(instanceName))
+        except Exception as err:
+            logger.error("Unable to remove the instance {} from sensu, Exception : {}".format(instanceName,err))
+
     def initiateTask(self,action,environmentValue):
         logger.info("The script is started")
         try:
@@ -59,14 +84,17 @@ class gcpStopStart:
                         if i['key'] == "environment" and i['value'] == str(environmentValue):
                             if action == "stop":
                                 if instance_row["status"] == "RUNNING":
-                                    self.stopInsances(self.gcpConnect(),instance_row["id"],instance_row["name"])
+                                    self.slienceMonitoring(instance_row["name"])
+                                    time.sleep(10)
+                                    self.stopInsances(compute_client,instance_row["id"],instance_row["name"])
+                                    self.removeMonitoring(instance_row["name"])
                                 else:
                                     logger.info(
                                         "Instance is already stopped/terminated state. Current state of the instance is : {}, Instance Name: {}".format(
                                             instance_row["status"], instance_row["name"]))
                             elif action == "start":
                                 if instance_row["status"] == "TERMINATED":
-                                    self.startInstances(self.gcpConnect(),instance_row["id"],instance_row["name"])
+                                    self.startInstances(compute_client,instance_row["id"],instance_row["name"])
                                 else:
                                     logger.info(
                                         "Instance is already Running state. Current state of the instance is : {}, Instance Name: {}".format(
@@ -85,5 +113,8 @@ if __name__ == '__main__':
         logger.error(
             "Please Set the ACTION and ENVIRONMENT as environment variable, Exception : {}".format(err))
         raise err
-    callFunc = gcpStopStart()
-    callFunc.initiateTask(ACTION,ENVIRONMENT)
+    if ACTION and ENVIRONMENT:
+        callFunc = gcpStopStart()
+        callFunc.initiateTask(ACTION,ENVIRONMENT)
+    else:
+        logger.error("The ACTION or ENVIRONMENT value is empty")
